@@ -33,11 +33,11 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SYMBOL              = os.environ.get("SYMBOL", "XAUUSD=X")
-SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "60"))
+SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "300"))  # 5 min = 576 appels/jour (limite free: 800)
 COOLDOWN_MINUTES    = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 MIN_SCORE_1M        = int(os.environ.get("MIN_SCORE_1M", "4"))
 MIN_SCORE_5M        = int(os.environ.get("MIN_SCORE_5M", "2"))
-FINNHUB_KEY         = os.environ.get("FINNHUB_KEY", "d8k2b71r01qjgd6qig80d8k2b71r01qjgd6qig8g")
+TWELVE_DATA_KEY     = os.environ.get("TWELVE_DATA_KEY", "")
 BARS_1M             = 120
 BARS_5M             = 60
 
@@ -217,45 +217,39 @@ def format_signal_message(direction, levels, a1m, a5m, qlabel, qemoji):
     )
 
 # ═══════════════════════════════════════════════════
-#  DONNÉES — Finnhub (fonctionne sur tous les serveurs cloud)
+#  DONNÉES — Twelve Data (gratuit, fonctionne sur cloud)
 # ═══════════════════════════════════════════════════
 
 def fetch_data(symbol, interval, bars):
-    """Récupère les bougies OHLC depuis Finnhub API."""
+    """Récupère les bougies OHLC depuis Twelve Data API."""
     try:
-        resolution = "1" if interval == "1m" else "5"
-        to_ts = int(time.time())
-        # Fenêtre de temps : 4h pour 1m, 24h pour 5m
-        seconds_back = 4 * 3600 if interval == "1m" else 24 * 3600
-        from_ts = to_ts - seconds_back
-
+        # Twelve Data interval format
+        td_interval = "1min" if interval == "1m" else "5min"
         url = (
-            f"https://finnhub.io/api/v1/forex/candle"
-            f"?symbol=OANDA:XAU_USD&resolution={resolution}"
-            f"&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}"
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol=XAU/USD&interval={td_interval}"
+            f"&outputsize={bars}&apikey={TWELVE_DATA_KEY}"
         )
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)
         data = resp.json()
 
-        if data.get("s") != "ok" or not data.get("c"):
-            log.warning(f"Finnhub: pas de données pour {interval} (status={data.get('s')})")
+        if data.get("status") == "error":
+            log.error(f"Twelve Data erreur: {data.get('message')}")
             return None
 
-        df = pd.DataFrame({
-            "Open":   data["o"],
-            "High":   data["h"],
-            "Low":    data["l"],
-            "Close":  data["c"],
-            "Volume": data["v"],
-        }, index=pd.to_datetime(data["t"], unit="s", utc=True))
-
-        df = df.tail(bars).copy()
-
-        if len(df) < 60:
-            log.warning(f"Données insuffisantes {interval}: {len(df)} barres")
+        values = data.get("values")
+        if not values or len(values) < 60:
+            log.warning(f"Twelve Data: données insuffisantes {interval}: {len(values) if values else 0} barres")
             return None
 
-        return df
+        df = pd.DataFrame(values)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+        for col in ["Open","High","Low","Close"]:
+            df[col] = pd.to_numeric(df[col])
+
+        return df.tail(bars)
 
     except Exception as e:
         log.error(f"Erreur fetch {interval}: {e}")
@@ -271,7 +265,10 @@ def run():
     log.info("━" * 50)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("⛔ TELEGRAM_TOKEN et TELEGRAM_CHAT_ID doivent être définis en variables d'environnement Railway.")
+        log.error("⛔ TELEGRAM_TOKEN et TELEGRAM_CHAT_ID doivent être définis en variables d'environnement.")
+        return
+    if not TWELVE_DATA_KEY:
+        log.error("⛔ TWELVE_DATA_KEY doit être défini en variable d'environnement (compte gratuit sur twelvedata.com).")
         return
 
     send_telegram(
