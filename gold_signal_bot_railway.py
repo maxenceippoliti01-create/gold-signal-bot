@@ -24,7 +24,6 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
 # ═══════════════════════════════════════════════════
 #  CONFIGURATION — depuis les variables d'environnement
@@ -38,6 +37,7 @@ SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "60"))
 COOLDOWN_MINUTES    = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 MIN_SCORE_1M        = int(os.environ.get("MIN_SCORE_1M", "4"))
 MIN_SCORE_5M        = int(os.environ.get("MIN_SCORE_5M", "2"))
+FINNHUB_KEY         = os.environ.get("FINNHUB_KEY", "d8k2b71r01qjgd6qig80d8k2b71r01qjgd6qig8g")
 BARS_1M             = 120
 BARS_5M             = 60
 
@@ -217,22 +217,48 @@ def format_signal_message(direction, levels, a1m, a5m, qlabel, qemoji):
     )
 
 # ═══════════════════════════════════════════════════
-#  DONNÉES
+#  DONNÉES — Finnhub (fonctionne sur tous les serveurs cloud)
 # ═══════════════════════════════════════════════════
 
 def fetch_data(symbol, interval, bars):
+    """Récupère les bougies OHLC depuis Finnhub API."""
     try:
-        period = "1d" if interval == "1m" else "5d"
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df.empty or len(df) < 60:
-            log.warning(f"Données insuffisantes {symbol} {interval}: {len(df)} barres")
+        resolution = "1" if interval == "1m" else "5"
+        to_ts = int(time.time())
+        # Fenêtre de temps : 4h pour 1m, 24h pour 5m
+        seconds_back = 4 * 3600 if interval == "1m" else 24 * 3600
+        from_ts = to_ts - seconds_back
+
+        url = (
+            f"https://finnhub.io/api/v1/forex/candle"
+            f"?symbol=OANDA:XAU_USD&resolution={resolution}"
+            f"&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}"
+        )
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+
+        if data.get("s") != "ok" or not data.get("c"):
+            log.warning(f"Finnhub: pas de données pour {interval} (status={data.get('s')})")
             return None
+
+        df = pd.DataFrame({
+            "Open":   data["o"],
+            "High":   data["h"],
+            "Low":    data["l"],
+            "Close":  data["c"],
+            "Volume": data["v"],
+        }, index=pd.to_datetime(data["t"], unit="s", utc=True))
+
         df = df.tail(bars).copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+
+        if len(df) < 60:
+            log.warning(f"Données insuffisantes {interval}: {len(df)} barres")
+            return None
+
         return df
+
     except Exception as e:
-        log.error(f"Erreur fetch {symbol} {interval}: {e}")
+        log.error(f"Erreur fetch {interval}: {e}")
         return None
 
 # ═══════════════════════════════════════════════════
