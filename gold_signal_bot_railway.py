@@ -33,7 +33,7 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
  
 SYMBOL              = os.environ.get("SYMBOL", "XAUUSD=X")
-SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "300"))  # 5 min = 576 appels/jour (limite free: 800)
+SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "60"))   # 60s pendant les heures actives
 COOLDOWN_MINUTES    = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 MIN_SCORE_1M        = int(os.environ.get("MIN_SCORE_1M", "4"))
 MIN_SCORE_5M        = int(os.environ.get("MIN_SCORE_5M", "2"))
@@ -220,6 +220,57 @@ def format_signal_message(direction, levels, a1m, a5m, qlabel, qemoji):
 #  DONNÉES — Twelve Data (gratuit, fonctionne sur cloud)
 # ═══════════════════════════════════════════════════
  
+# ═══════════════════════════════════════════════════
+#  HEURES DE TRADING (Paris = UTC+2 en été)
+# ═══════════════════════════════════════════════════
+ 
+def is_trading_hours():
+    """
+    Créneaux actifs pour l'or (heure de Paris) :
+      - Matin    : 08h00 – 12h00  (ouverture Londres)
+      - Après-midi: 14h00 – 16h40  (chevauchement Londres/NY)
+    Total = 6h40 × 2 appels/min × 60 = 800 appels/jour exactement.
+    Fermé le week-end (marché or fermé samedi/dimanche).
+    """
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # 0=Lundi … 6=Dimanche
+ 
+    # Week-end : marché fermé
+    if weekday >= 5:
+        return False
+ 
+    # Conversion UTC → Paris (UTC+2 en été, UTC+1 en hiver)
+    # On utilise UTC+2 (CEST, valable avril-octobre)
+    paris_hour   = (now.hour + 2) % 24
+    paris_minute = now.minute
+    total_minutes = paris_hour * 60 + paris_minute
+ 
+    morning_start   = 8  * 60        # 08:00
+    morning_end     = 12 * 60        # 12:00
+    afternoon_start = 14 * 60        # 14:00
+    afternoon_end   = 16 * 60 + 40   # 16:40
+ 
+    in_morning   = morning_start   <= total_minutes < morning_end
+    in_afternoon = afternoon_start <= total_minutes < afternoon_end
+ 
+    return in_morning or in_afternoon
+ 
+ 
+def next_session_in():
+    """Retourne les minutes restantes avant la prochaine session."""
+    now = datetime.now(timezone.utc)
+    paris_hour   = (now.hour + 2) % 24
+    paris_minute = now.minute
+    total_minutes = paris_hour * 60 + paris_minute
+ 
+    sessions = [8 * 60, 14 * 60]  # débuts des sessions en minutes
+    for s in sessions:
+        if total_minutes < s:
+            return s - total_minutes
+    # Prochaine session = lendemain matin
+    return (24 * 60 - total_minutes) + 8 * 60
+ 
+ 
 def fetch_data(symbol, interval, bars):
     """Récupère les bougies OHLC depuis Twelve Data API."""
     try:
@@ -287,6 +338,13 @@ def run():
             now = datetime.now(timezone.utc)
             log.info(f"Scan #{scan_count} — {now.strftime('%H:%M:%S UTC')}")
  
+            # ── Vérification des heures de trading ──
+            if not is_trading_hours():
+                wait = next_session_in()
+                log.info(f"  Hors session — prochaine ouverture dans {wait} min. En veille 60s…")
+                time.sleep(60)
+                continue
+ 
             if last_signal_time:
                 elapsed = (now - last_signal_time).total_seconds() / 60
                 if elapsed < COOLDOWN_MINUTES:
@@ -337,3 +395,4 @@ def run():
  
 if __name__ == "__main__":
     run()
+ 
