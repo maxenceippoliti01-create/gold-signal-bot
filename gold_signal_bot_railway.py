@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║       GOLD SIGNAL BOT v3.0 — Render/Railway (cloud 24/7)    ║
-║  Lit les credentials depuis les variables d'environnement    ║
+║       GOLD SIGNAL BOT v4.0 — Day Trading Edition            ║
+║       Render/Railway · cloud 24/7                           ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Variables d'environnement requises :
@@ -10,19 +10,22 @@ Variables d'environnement requises :
   TWELVE_DATA_KEY  — clé API Twelve Data (twelvedata.com gratuit)
 
 Variables optionnelles :
-  SCAN_INTERVAL      — secondes entre chaque scan (défaut: 60)
-  COOLDOWN_MINUTES   — délai min entre 2 signaux (défaut: 15)
-  MIN_SCORE_1M       — confluence BUY requise 1m (défaut: 4)
-  MIN_SCORE_5M       — confluence BUY requise 5m (défaut: 2)
-  MIN_SCORE_SELL_1M  — confluence SELL requise 1m (défaut: 3)
-  MIN_SCORE_SELL_5M  — confluence SELL requise 5m (défaut: 2)
+  SCAN_INTERVAL      — secondes entre chaque scan (défaut: 900 = 15 min)
+  COOLDOWN_MINUTES   — délai min entre 2 signaux (défaut: 180 = 3h)
+  MIN_SCORE_15M      — confluence requise 15m (défaut: 4)
+  MIN_SCORE_1H       — confluence requise 1h  (défaut: 3)
+  MIN_SCORE_SELL_15M — seuil SELL 15m         (défaut: 3)
+  MIN_SCORE_SELL_1H  — seuil SELL 1h          (défaut: 2)
 
-v3.0 — Corrections :
-  - Zone d'entrée (low–high) au lieu d'un prix unique
-  - Prix temps réel via Finnhub (corrige décalage $20–30 vs MT4/TradingView)
-  - Seuil SELL à 3/6 (était 4/6) → signaux de vente activés
-  - EMA50 neutre quand prix très proche (±0.15%) → évite biais haussier permanent
-  - MACD neutre quand momentum s'inverse → moins de faux signaux
+v4.0 — Day Trading :
+  - Timeframes 15m + 1h (au lieu de 1m + 5m)
+  - RSI à 40/60 (moins extrême, capte les retournements de tendance)
+  - Stochastique à 20/80 (standard day trading)
+  - SL = 2×ATR · TP1 = 1.5× · TP2 = 3× · TP3 = 5× (objectifs ambitieux)
+  - Zone d'entrée ±0.3×ATR
+  - Scan toutes les 15 min → ~50 appels/jour → couverture 07h-21h Paris
+  - Cooldown 3h entre signaux (1-3 trades/jour max)
+  - Prix temps réel Finnhub pour niveaux précis
 """
 
 import os
@@ -36,7 +39,7 @@ import pandas as pd
 import requests
 
 # ═══════════════════════════════════════════════════
-#  CONFIGURATION — depuis les variables d'environnement
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
@@ -44,17 +47,16 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY", "")
 FINNHUB_KEY       = os.environ.get("FINNHUB_KEY", "d8k2b71r01qjgd6qig80d8k2b71r01qjgd6qig8g")
 
-SCAN_INTERVAL_SEC  = int(os.environ.get("SCAN_INTERVAL", "60"))
-COOLDOWN_MINUTES   = int(os.environ.get("COOLDOWN_MINUTES", "15"))
+SCAN_INTERVAL_SEC   = int(os.environ.get("SCAN_INTERVAL", "900"))    # 15 minutes
+COOLDOWN_MINUTES    = int(os.environ.get("COOLDOWN_MINUTES", "180"))  # 3 heures
 
-# Seuils BUY (strict) et SELL (plus souple — l'or est souvent en tendance haussière)
-MIN_SCORE_1M       = int(os.environ.get("MIN_SCORE_1M", "4"))
-MIN_SCORE_5M       = int(os.environ.get("MIN_SCORE_5M", "2"))
-MIN_SCORE_SELL_1M  = int(os.environ.get("MIN_SCORE_SELL_1M", "3"))
-MIN_SCORE_SELL_5M  = int(os.environ.get("MIN_SCORE_SELL_5M", "2"))
+MIN_SCORE_15M       = int(os.environ.get("MIN_SCORE_15M", "4"))
+MIN_SCORE_1H        = int(os.environ.get("MIN_SCORE_1H",  "3"))
+MIN_SCORE_SELL_15M  = int(os.environ.get("MIN_SCORE_SELL_15M", "3"))
+MIN_SCORE_SELL_1H   = int(os.environ.get("MIN_SCORE_SELL_1H",  "2"))
 
-BARS_1M = 120
-BARS_5M = 60
+BARS_15M = 100   # 100 × 15 min = 25h d'historique
+BARS_1H  = 72    # 72 × 1h     = 3 jours d'historique
 
 # ═══════════════════════════════════════════════════
 #  LOGGING
@@ -84,9 +86,9 @@ def rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 def macd(close, fast=12, slow=26, signal=9):
-    macd_line = ema(close, fast) - ema(close, slow)
+    macd_line   = ema(close, fast) - ema(close, slow)
     signal_line = ema(macd_line, signal)
-    histogram = macd_line - signal_line
+    histogram   = macd_line - signal_line
     return macd_line, signal_line, histogram
 
 def bollinger_bands(close, period=20, std_dev=2):
@@ -95,8 +97,8 @@ def bollinger_bands(close, period=20, std_dev=2):
     return sma + std_dev * std, sma, sma - std_dev * std
 
 def stochastic(high, low, close, k=14, d=3):
-    lowest_low = low.rolling(k).min()
-    highest_high = high.rolling(k).max()
+    lowest_low    = low.rolling(k).min()
+    highest_high  = high.rolling(k).max()
     pct_k = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
     pct_d = pct_k.rolling(d).mean()
     return pct_k, pct_d
@@ -111,107 +113,97 @@ def atr(high, low, close, period=14):
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 # ═══════════════════════════════════════════════════
-#  PRIX TEMPS RÉEL — Finnhub (corrige décalage vs MT4)
+#  PRIX TEMPS RÉEL — Finnhub
 # ═══════════════════════════════════════════════════
 
 def get_realtime_price():
-    """
-    Récupère le prix temps réel de l'or via Finnhub.
-
-    Pourquoi : Twelve Data retourne le CLOSE de la dernière bougie TERMINÉE.
-    Sur 1m, cela signifie un retard de 0–60 secondes, mais avec la latence API
-    et le fait que la bougie précédente est souvent la plus récente, on peut avoir
-    1 à 5 minutes de décalage → $20–30 d'écart vs TradingView/MT4 en temps réel.
-    Finnhub /quote renvoie le prix du marché actuel, sans délai.
-    """
     try:
         resp = requests.get(
             f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_KEY}",
             timeout=5
         )
-        data = resp.json()
-        price = data.get("c")  # "c" = current price
-        if price and float(price) > 1000:  # Sanity check (or toujours > $1000)
+        data  = resp.json()
+        price = data.get("c")
+        if price and float(price) > 1000:
             log.info(f"  Prix temps réel (Finnhub): ${float(price):,.2f}")
             return float(price)
         log.warning(f"  Finnhub quote inattendu: {data}")
         return None
     except Exception as e:
-        log.warning(f"  Finnhub quote erreur: {e} — fallback Twelve Data")
+        log.warning(f"  Finnhub erreur: {e} — fallback Twelve Data")
         return None
 
 # ═══════════════════════════════════════════════════
-#  ANALYSE & SCORING
+#  ANALYSE & SCORING (optimisé day trading)
 # ═══════════════════════════════════════════════════
 
-def compute_signals(df):
+def compute_signals(df, timeframe="15m"):
     close, high, low = df["Close"], df["High"], df["Low"]
 
     rsi_val = rsi(close).iloc[-1]
-    macd_line, signal_line, histogram = macd(close)
+    _, _, histogram = macd(close)
     hist_val  = histogram.iloc[-1]
     hist_prev = histogram.iloc[-2]
     ema9  = ema(close, 9).iloc[-1]
     ema21 = ema(close, 21).iloc[-1]
     ema50 = ema(close, 50).iloc[-1]
     bb_upper, bb_mid, bb_lower = bollinger_bands(close)
-    bb_u = bb_upper.iloc[-1]
-    bb_l = bb_lower.iloc[-1]
-    bb_m = bb_mid.iloc[-1]
+    bb_u  = bb_upper.iloc[-1]
+    bb_l  = bb_lower.iloc[-1]
+    bb_m  = bb_mid.iloc[-1]
     price = close.iloc[-1]
     stoch_k, stoch_d = stochastic(high, low, close)
-    sk = stoch_k.iloc[-1]; sd = stoch_d.iloc[-1]
+    sk      = stoch_k.iloc[-1]; sd      = stoch_d.iloc[-1]
     sk_prev = stoch_k.iloc[-2]; sd_prev = stoch_d.iloc[-2]
     atr_val = atr(high, low, close).iloc[-1]
 
     votes = {}
 
-    # ── RSI ──
-    if rsi_val < 35:   votes["RSI"] = ( 1, f"RSI {rsi_val:.1f} — Survendu ✅")
-    elif rsi_val > 65: votes["RSI"] = (-1, f"RSI {rsi_val:.1f} — Suracheté ✅")
+    # ── RSI — seuils 40/60 pour day trading ──
+    # (moins extrême que scalping 35/65 → capte les retournements plus tôt)
+    if rsi_val < 40:   votes["RSI"] = ( 1, f"RSI {rsi_val:.1f} — Survendu ✅")
+    elif rsi_val > 60: votes["RSI"] = (-1, f"RSI {rsi_val:.1f} — Suracheté ✅")
     else:              votes["RSI"] = ( 0, f"RSI {rsi_val:.1f} — Neutre")
 
     # ── MACD ──
-    # Croisements = signal fort | histogramme qui s'inverse = neutre (momentum change)
     if hist_prev < 0 and hist_val >= 0:
         votes["MACD"] = ( 1, f"MACD croisement haussier ✅")
     elif hist_prev > 0 and hist_val <= 0:
         votes["MACD"] = (-1, f"MACD croisement baissier ✅")
     elif hist_val > 0 and hist_val < hist_prev:
-        votes["MACD"] = ( 0, f"MACD haussier mais momentum baissier ({hist_val:.4f})")
+        votes["MACD"] = ( 0, f"MACD haussier momentum baissier ({hist_val:.3f})")
     elif hist_val < 0 and hist_val > hist_prev:
-        votes["MACD"] = ( 0, f"MACD baissier mais momentum haussier ({hist_val:.4f})")
+        votes["MACD"] = ( 0, f"MACD baissier momentum haussier ({hist_val:.3f})")
     elif hist_val > 0:
-        votes["MACD"] = ( 1, f"MACD haussier ({hist_val:.4f})")
+        votes["MACD"] = ( 1, f"MACD haussier ({hist_val:.3f})")
     else:
-        votes["MACD"] = (-1, f"MACD baissier ({hist_val:.4f})")
+        votes["MACD"] = (-1, f"MACD baissier ({hist_val:.3f})")
 
-    # ── EMA 9/21 ──
-    if ema9 > ema21:   votes["EMA9/21"] = ( 1, f"EMA9 > EMA21 ✅")
-    else:              votes["EMA9/21"] = (-1, f"EMA9 < EMA21 ✅")
+    # ── EMA 9/21 — croisement de tendance ──
+    if ema9 > ema21:   votes["EMA9/21"] = ( 1, f"EMA9 > EMA21 — Tendance haussière ✅")
+    else:              votes["EMA9/21"] = (-1, f"EMA9 < EMA21 — Tendance baissière ✅")
 
     # ── Bollinger Bands ──
     bb_range = bb_u - bb_l
     bb_pct = (price - bb_l) / bb_range if bb_range > 0 else 0.5
-    if bb_pct < 0.2:   votes["BB"] = ( 1, f"Prix proche bande basse BB ✅")
-    elif bb_pct > 0.8: votes["BB"] = (-1, f"Prix proche bande haute BB ✅")
+    if bb_pct < 0.2:   votes["BB"] = ( 1, f"Prix bande basse BB — Rebond potentiel ✅")
+    elif bb_pct > 0.8: votes["BB"] = (-1, f"Prix bande haute BB — Résistance ✅")
     elif price > bb_m: votes["BB"] = ( 1, f"Prix au-dessus BB mid")
     else:              votes["BB"] = (-1, f"Prix sous BB mid")
 
-    # ── Stochastique ──
+    # ── Stochastique — seuils 20/80 pour day trading ──
     if sk < 20 and sk > sd and sk_prev <= sd_prev:
         votes["Stoch"] = ( 1, f"Stoch croisement haussier survendu ✅")
     elif sk > 80 and sk < sd and sk_prev >= sd_prev:
         votes["Stoch"] = (-1, f"Stoch croisement baissier suracheté ✅")
-    elif sk < 30: votes["Stoch"] = ( 1, f"Stoch survendu ({sk:.1f})")
-    elif sk > 70: votes["Stoch"] = (-1, f"Stoch suracheté ({sk:.1f})")
+    elif sk < 20: votes["Stoch"] = ( 1, f"Stoch survendu ({sk:.1f}) ✅")
+    elif sk > 80: votes["Stoch"] = (-1, f"Stoch suracheté ({sk:.1f}) ✅")
     else:         votes["Stoch"] = ( 0, f"Stoch neutre ({sk:.1f})")
 
-    # ── EMA 50 (Tendance de fond) ──
-    # Zone neutre si prix très proche de l'EMA50 (±0.15%) → évite de toujours voter +1
+    # ── EMA 50 — filtre de tendance de fond ──
     diff_pct = (price - ema50) / ema50 * 100
     if abs(diff_pct) < 0.15:
-        votes["EMA50"] = ( 0, f"Prix ≈ EMA50 (diff {diff_pct:+.2f}%) — Zone neutre")
+        votes["EMA50"] = ( 0, f"Prix ≈ EMA50 ({diff_pct:+.2f}%) — Zone neutre")
     elif price > ema50:
         votes["EMA50"] = ( 1, f"Prix > EMA50 — Tendance haussière ✅")
     else:
@@ -219,10 +211,9 @@ def compute_signals(df):
 
     score = sum(v[0] for v in votes.values())
 
-    # Direction avec seuils asymétriques (SELL plus facile à atteindre)
-    if score >= MIN_SCORE_1M:
+    if score >= MIN_SCORE_15M:
         direction = "BUY"
-    elif score <= -MIN_SCORE_SELL_1M:
+    elif score <= -MIN_SCORE_SELL_15M:
         direction = "SELL"
     else:
         direction = "NEUTRAL"
@@ -237,25 +228,29 @@ def compute_signals(df):
 
 def compute_levels(realtime_price, direction, atr_val):
     """
-    Calcule les niveaux avec une ZONE d'entrée (low–high) ± 0.2×ATR.
-    Utilise le prix temps réel Finnhub pour être aligné avec MT4/TradingView.
+    Niveaux optimisés day trading :
+      Zone d'entrée : ±0.3×ATR
+      Stop Loss     : 2×ATR   (laisser respirer le trade)
+      TP1           : 1.5×ATR (R:R 0.75 — sécuriser rapidement)
+      TP2           : 3×ATR   (R:R 1.5)
+      TP3           : 5×ATR   (R:R 2.5 — objectif ambitieux)
     """
-    price = realtime_price
-    entry_half = round(atr_val * 0.2, 2)
+    price      = realtime_price
+    entry_half = round(atr_val * 0.3, 2)
     entry_low  = round(price - entry_half, 2)
     entry_high = round(price + entry_half, 2)
-    sl_d       = round(atr_val * 1.5, 2)
+    sl_d       = round(atr_val * 2.0, 2)
 
     if direction == "BUY":
         sl  = round(price - sl_d, 2)
-        tp1 = round(price + atr_val * 1.0, 2)
-        tp2 = round(price + atr_val * 2.0, 2)
-        tp3 = round(price + atr_val * 3.0, 2)
-    else:  # SELL
+        tp1 = round(price + atr_val * 1.5, 2)
+        tp2 = round(price + atr_val * 3.0, 2)
+        tp3 = round(price + atr_val * 5.0, 2)
+    else:
         sl  = round(price + sl_d, 2)
-        tp1 = round(price - atr_val * 1.0, 2)
-        tp2 = round(price - atr_val * 2.0, 2)
-        tp3 = round(price - atr_val * 3.0, 2)
+        tp1 = round(price - atr_val * 1.5, 2)
+        tp2 = round(price - atr_val * 3.0, 2)
+        tp3 = round(price - atr_val * 5.0, 2)
 
     return {
         "entry":      price,
@@ -263,16 +258,16 @@ def compute_levels(realtime_price, direction, atr_val):
         "entry_high": entry_high,
         "sl":         sl,
         "sl_dist":    sl_d,
-        "tp1":  tp1, "rr1": round(atr_val / sl_d, 2),
-        "tp2":  tp2, "rr2": round(atr_val * 2 / sl_d, 2),
-        "tp3":  tp3, "rr3": round(atr_val * 3 / sl_d, 2),
+        "tp1":  tp1, "rr1": round(1.5 / 2.0, 2),
+        "tp2":  tp2, "rr2": round(3.0 / 2.0, 2),
+        "tp3":  tp3, "rr3": round(5.0 / 2.0, 2),
     }
 
-def signal_quality(s1, s5):
-    combined = abs(s1) + abs(s5)
-    if combined >= 10: return "FORT",    "🔥🔥🔥"
-    elif combined >= 8: return "ÉLEVÉ",  "🔥🔥"
-    elif combined >= 6: return "MODÉRÉ", "🔥"
+def signal_quality(s15m, s1h):
+    combined = abs(s15m) + abs(s1h)
+    if combined >= 9:  return "FORT",    "🔥🔥🔥"
+    elif combined >= 7: return "ÉLEVÉ",  "🔥🔥"
+    elif combined >= 5: return "MODÉRÉ", "🔥"
     else:               return "FAIBLE", "⚡"
 
 # ═══════════════════════════════════════════════════
@@ -296,72 +291,68 @@ def send_telegram(message):
         log.error(f"Telegram exception: {e}")
         return False
 
-def format_signal_message(direction, levels, a1m, a5m, qlabel, qemoji):
-    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+def format_signal_message(direction, levels, a15m, a1h, qlabel, qemoji):
+    now       = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     dir_emoji = "🟢" if direction == "BUY" else "🔴"
     dir_label = "ACHAT" if direction == "BUY" else "VENTE"
-    entry = levels["entry"]
+    entry     = levels["entry"]
 
     def pct(v):
-        return f"{((v - entry) / entry * 100):+.2f}%"
+        return f"{((v - entry) / entry * 100):+.3f}%"
 
     votes_lines = "".join(
         f"  {'🟢' if v > 0 else ('🔴' if v < 0 else '⚪')} {desc}\n"
-        for _, (v, desc) in a1m["votes"].items()
+        for _, (v, desc) in a15m["votes"].items()
     )
 
     return (
         f"╔══════════════════════════╗\n"
         f"║  🥇 SIGNAL XAU/USD Gold  ║\n"
+        f"║     📅 DAY TRADING       ║\n"
         f"╚══════════════════════════╝\n\n"
         f"{dir_emoji} <b>{dir_label}</b> · Qualité: {qemoji} {qlabel}\n"
-        f"⏱ Scalping 1m (confirmé 5m)\n\n"
+        f"⏱ Day Trading 15m (confirmé 1h)\n\n"
         f"━━━━━━━━━ NIVEAUX ━━━━━━━━━\n"
         f"💰 <b>Zone d'entrée :</b>\n"
         f"   ${levels['entry_low']:,.2f} — ${levels['entry_high']:,.2f}\n"
         f"   <i>(prix actuel : ${entry:,.2f})</i>\n\n"
         f"🛑 <b>Stop Loss :</b>  ${levels['sl']:,.2f}  "
-        f"({pct(levels['sl'])} · -{levels['sl_dist']:.2f}$)\n"
-        f"🎯 <b>TP1 :</b>       ${levels['tp1']:,.2f}  "
+        f"({pct(levels['sl'])} · -{levels['sl_dist']:.2f}$)\n\n"
+        f"🎯 <b>TP1 :</b> ${levels['tp1']:,.2f}  "
         f"({pct(levels['tp1'])} · R:R {levels['rr1']})\n"
-        f"🎯 <b>TP2 :</b>       ${levels['tp2']:,.2f}  "
+        f"🎯 <b>TP2 :</b> ${levels['tp2']:,.2f}  "
         f"({pct(levels['tp2'])} · R:R {levels['rr2']})\n"
-        f"🎯 <b>TP3 :</b>       ${levels['tp3']:,.2f}  "
+        f"🎯 <b>TP3 :</b> ${levels['tp3']:,.2f}  "
         f"({pct(levels['tp3'])} · R:R {levels['rr3']})\n\n"
-        f"━━━━ INDICATEURS 1m ━━━━━\n"
+        f"━━━━ INDICATEURS 15m ━━━━━\n"
         f"{votes_lines}\n"
-        f"Score 1m : {a1m['score']:+d}/6   Score 5m : {a5m['score']:+d}/6\n\n"
+        f"Score 15m : {a15m['score']:+d}/6   Score 1h : {a1h['score']:+d}/6\n\n"
         f"⚠️ <i>Gérer votre risque. Signal automatique.</i>\n"
         f"🕐 {now}"
     )
 
 # ═══════════════════════════════════════════════════
-#  DONNÉES — Twelve Data (OHLC pour les indicateurs)
+#  DONNÉES — Twelve Data
 # ═══════════════════════════════════════════════════
 
-def fetch_data(symbol, interval, bars):
-    """
-    Récupère les bougies OHLC depuis Twelve Data pour calculer les indicateurs.
-    Le prix affiché dans les signaux vient de Finnhub (temps réel), pas de Twelve Data.
-    """
+def fetch_data(interval, bars):
     try:
-        td_interval = "1min" if interval == "1m" else "5min"
+        td_map = {"15m": "15min", "1h": "1h"}
         url = (
             f"https://api.twelvedata.com/time_series"
-            f"?symbol=XAU/USD&interval={td_interval}"
+            f"?symbol=XAU/USD&interval={td_map[interval]}"
             f"&outputsize={bars}&apikey={TWELVE_DATA_KEY}"
         )
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
+        resp  = requests.get(url, timeout=15)
+        data  = resp.json()
 
         if data.get("status") == "error":
             log.error(f"Twelve Data erreur: {data.get('message')}")
             return None
 
         values = data.get("values")
-        if not values or len(values) < 60:
-            log.warning(f"Twelve Data données insuffisantes {interval}: "
-                        f"{len(values) if values else 0} barres")
+        if not values or len(values) < 30:
+            log.warning(f"Données insuffisantes {interval}: {len(values) if values else 0} barres")
             return None
 
         df = pd.DataFrame(values)
@@ -381,39 +372,36 @@ def fetch_data(symbol, interval, bars):
         return None
 
 # ═══════════════════════════════════════════════════
-#  HEURES DE TRADING (Paris = UTC+2 en été)
+#  HEURES DE TRADING — 07h-21h Paris (sessions complètes)
 # ═══════════════════════════════════════════════════
 
 def is_trading_hours():
     """
-    Créneaux actifs (heure de Paris) :
-      Matin     : 08h00 – 12h00
-      Après-midi: 14h00 – 16h40
-    = 800 appels/jour exactement (limite free Twelve Data).
+    Day trading XAU/USD — sessions actives (heure de Paris UTC+2) :
+      07h00 – 21h00  (pré-Londres + Londres + NY)
+    Scan toutes les 15 min → 56 scans/jour × 2 timeframes = ~112 appels/jour.
+    Largement sous la limite gratuite Twelve Data (800/jour).
     Fermé le week-end.
     """
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
 
-    paris_hour   = (now.hour + 2) % 24  # UTC+2 (CEST, avril–octobre)
-    paris_minute = now.minute
-    total_min    = paris_hour * 60 + paris_minute
+    paris_hour  = (now.hour + 2) % 24
+    paris_min   = now.minute
+    total_min   = paris_hour * 60 + paris_min
 
-    in_morning   = (8 * 60) <= total_min < (12 * 60)
-    in_afternoon = (14 * 60) <= total_min < (16 * 60 + 40)
-    return in_morning or in_afternoon
+    return (7 * 60) <= total_min < (21 * 60)
 
 def next_session_in():
-    now = datetime.now(timezone.utc)
-    paris_hour   = (now.hour + 2) % 24
-    paris_minute = now.minute
-    total_min    = paris_hour * 60 + paris_minute
+    now        = datetime.now(timezone.utc)
+    paris_hour = (now.hour + 2) % 24
+    paris_min  = now.minute
+    total_min  = paris_hour * 60 + paris_min
 
-    for s in [8 * 60, 14 * 60]:
-        if total_min < s:
-            return s - total_min
-    return (24 * 60 - total_min) + 8 * 60
+    if total_min < 7 * 60:
+        return 7 * 60 - total_min
+    return (24 * 60 - total_min) + 7 * 60  # Lendemain 07h
 
 # ═══════════════════════════════════════════════════
 #  BOUCLE PRINCIPALE
@@ -421,25 +409,26 @@ def next_session_in():
 
 def run():
     log.info("━" * 50)
-    log.info("  GOLD SIGNAL BOT v3.0 — Render Edition")
+    log.info("  GOLD SIGNAL BOT v4.0 — Day Trading")
     log.info("━" * 50)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("⛔ TELEGRAM_TOKEN et TELEGRAM_CHAT_ID doivent être définis.")
         return
     if not TWELVE_DATA_KEY:
-        log.error("⛔ TWELVE_DATA_KEY doit être défini (compte gratuit twelvedata.com).")
+        log.error("⛔ TWELVE_DATA_KEY doit être défini.")
         return
 
     send_telegram(
-        "🤖 <b>Gold Signal Bot v3.0 démarré</b>\n\n"
-        f"📊 XAU/USD (prix temps réel Finnhub)\n"
-        f"⏱ Scan toutes les {SCAN_INTERVAL_SEC}s\n"
-        f"📡 BUY : {MIN_SCORE_1M}/6 (1m) + {MIN_SCORE_5M}/6 (5m)\n"
-        f"📡 SELL : {MIN_SCORE_SELL_1M}/6 (1m) + {MIN_SCORE_SELL_5M}/6 (5m)\n"
-        f"⏳ Cooldown : {COOLDOWN_MINUTES} min\n\n"
+        "🤖 <b>Gold Signal Bot v4.0 — Day Trading</b>\n\n"
+        f"📊 XAU/USD · 15m confirmé 1h\n"
+        f"⏱ Scan toutes les {SCAN_INTERVAL_SEC // 60} min\n"
+        f"🕐 Sessions : 07h–21h Paris\n"
+        f"📡 BUY : {MIN_SCORE_15M}/6 (15m) + {MIN_SCORE_1H}/6 (1h)\n"
+        f"📡 SELL : {MIN_SCORE_SELL_15M}/6 (15m) + {MIN_SCORE_SELL_1H}/6 (1h)\n"
+        f"⏳ Cooldown : {COOLDOWN_MINUTES // 60}h entre signaux\n\n"
         f"✅ Bot opérationnel 24/7\n"
-        f"🆕 Zone d'entrée · Prix corrigé · Signaux SELL activés"
+        f"🎯 Objectif : 1–3 trades/jour qualité"
     )
 
     last_signal_time = None
@@ -454,69 +443,71 @@ def run():
             # ── Heures de trading ──
             if not is_trading_hours():
                 wait = next_session_in()
-                log.info(f"  Hors session — prochaine dans {wait} min. Veille 60s…")
-                time.sleep(60)
+                log.info(f"  Hors session — prochaine dans {wait} min. Veille 5 min…")
+                time.sleep(300)
                 continue
 
             # ── Cooldown ──
             if last_signal_time:
                 elapsed = (now - last_signal_time).total_seconds() / 60
                 if elapsed < COOLDOWN_MINUTES:
-                    log.info(f"  Cooldown actif ({elapsed:.1f}/{COOLDOWN_MINUTES} min)")
+                    remaining = COOLDOWN_MINUTES - elapsed
+                    log.info(f"  Cooldown actif — encore {remaining:.0f} min")
                     time.sleep(SCAN_INTERVAL_SEC)
                     continue
 
             # ── Données OHLC ──
-            df_1m = fetch_data("XAU/USD", "1m", BARS_1M)
-            df_5m = fetch_data("XAU/USD", "5m", BARS_5M)
+            df_15m = fetch_data("15m", BARS_15M)
+            df_1h  = fetch_data("1h",  BARS_1H)
 
-            if df_1m is None or df_5m is None:
-                log.warning("  Données manquantes, retry dans 30s…")
-                time.sleep(30)
+            if df_15m is None or df_1h is None:
+                log.warning("  Données manquantes, retry dans 2 min…")
+                time.sleep(120)
                 continue
 
             # ── Indicateurs ──
-            a1m = compute_signals(df_1m)
-            a5m = compute_signals(df_5m)
+            a15m = compute_signals(df_15m, "15m")
+            a1h  = compute_signals(df_1h,  "1h")
 
-            # ── Prix temps réel (Finnhub) ──
+            # ── Prix temps réel ──
             realtime_price = get_realtime_price()
             if realtime_price is None:
-                realtime_price = a1m["price"]  # Fallback Twelve Data
-                log.warning(f"  Fallback prix Twelve Data: ${realtime_price:,.2f}")
+                realtime_price = a15m["price"]
+                log.warning(f"  Fallback Twelve Data: ${realtime_price:,.2f}")
 
             log.info(
                 f"  Prix: ${realtime_price:,.2f}  |  "
-                f"Score 1m: {a1m['score']:+d}  |  Score 5m: {a5m['score']:+d}"
+                f"Score 15m: {a15m['score']:+d}  |  Score 1h: {a1h['score']:+d}  |  "
+                f"15m={a15m['direction']}  1h={a1h['direction']}"
             )
 
             # ── Détection signal ──
+            # Confluences requises : 15m primaire + 1h confirme la direction
             direction = None
-            if a1m["direction"] == "BUY" \
-                    and a1m["score"] >= MIN_SCORE_1M \
-                    and a5m["score"] >= MIN_SCORE_5M:
+
+            if (a15m["direction"] == "BUY"
+                    and a15m["score"] >= MIN_SCORE_15M
+                    and a1h["score"] >= MIN_SCORE_1H):
                 direction = "BUY"
-            elif a1m["direction"] == "SELL" \
-                    and a1m["score"] <= -MIN_SCORE_SELL_1M \
-                    and a5m["score"] <= -MIN_SCORE_SELL_5M:
+
+            elif (a15m["direction"] == "SELL"
+                    and a15m["score"] <= -MIN_SCORE_SELL_15M
+                    and a1h["score"] <= -MIN_SCORE_SELL_1H):
                 direction = "SELL"
 
             if direction:
-                qlabel, qemoji = signal_quality(a1m["score"], a5m["score"])
-                levels = compute_levels(realtime_price, direction, a1m["atr"])
+                qlabel, qemoji = signal_quality(a15m["score"], a1h["score"])
+                levels = compute_levels(realtime_price, direction, a15m["atr"])
                 log.info(
                     f"  ✦ SIGNAL {direction} — {qlabel} — "
-                    f"Zone ${levels['entry_low']:,.2f}–${levels['entry_high']:,.2f}"
+                    f"Zone ${levels['entry_low']:,.2f}–${levels['entry_high']:,.2f}  "
+                    f"SL ${levels['sl']:,.2f}  TP3 ${levels['tp3']:,.2f}"
                 )
-                msg = format_signal_message(direction, levels, a1m, a5m, qlabel, qemoji)
+                msg = format_signal_message(direction, levels, a15m, a1h, qlabel, qemoji)
                 if send_telegram(msg):
                     last_signal_time = now
             else:
-                log.info(
-                    f"  Pas de signal — "
-                    f"1m={a1m['direction']} ({a1m['score']:+d}), "
-                    f"5m={a5m['direction']} ({a5m['score']:+d})"
-                )
+                log.info(f"  Pas de signal")
 
         except KeyboardInterrupt:
             log.info("Bot arrêté.")
@@ -525,7 +516,7 @@ def run():
         except Exception as e:
             log.error(f"Erreur: {e}")
             log.debug(traceback.format_exc())
-            time.sleep(30)
+            time.sleep(60)
             continue
 
         time.sleep(SCAN_INTERVAL_SEC)
